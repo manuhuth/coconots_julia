@@ -328,7 +328,7 @@ end
 
 function compute_starting_values_GP2_reparameterized(type, data)
     if type == "GP"
-        eta = 1 - (mean(data) / var(data))^0.5
+        eta = compute_eta_starting_value(data)
     elseif type == "Poisson"
         eta = 0
     end
@@ -366,12 +366,20 @@ function compute_starting_values_GP1(type, data)
     lambda = mean(data) * (1-alpha)
 
     if type == "GP"
-        eta = 1 - (mean(data) / var(data))^0.5
+        eta = compute_eta_starting_value(data)
         return [alpha, eta, lambda]
     elseif type == "Poisson"
         eta = 0
         return [alpha, lambda]
     end
+end
+
+function compute_eta_starting_value(data)
+    eta = 1 - (mean(data) / var(data))^0.5
+    if eta < 0
+        eta = 0.0001
+    end
+    return eta
 end
 
 
