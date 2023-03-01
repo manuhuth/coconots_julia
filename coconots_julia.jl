@@ -3,6 +3,7 @@ using Pkg
 #Pkg.add("ProfileView")
 
 using DelimitedFiles
+using Statistics
 using Random
 using Base.Threads
 using BSplines
@@ -70,20 +71,250 @@ function bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2, alpha3, eta
     beta1 = compute_beta_i(lambda, U, alpha1)
 
     sum = 0.0
-    for j in 0:min(y,z)
-        sum = sum + (lambda*U*(1-alpha1-alpha3) + eta*(y-j))^(y-j-1) *
-                    (lambda*U*(1-alpha1-alpha3) + eta*(z-j))^(z-j-1) *
-                    (lambda*U*(alpha1+alpha3) + eta*(j))^(j-1) /
-                    factorial(j) / factorial(y-j) / factorial(z-j) * exp(j*eta)
+    if max(y,z) >= 20
+        for j in 0:min(y,z)
+            sum = sum + (lambda*U*(1-alpha1-alpha3) + eta*(y-j))^(y-j-1) *
+                        (lambda*U*(1-alpha1-alpha3) + eta*(z-j))^(z-j-1) *
+                        (lambda*U*(alpha1+alpha3) + eta*(j))^(j-1) /
+                        factorial(big(j)) / factorial(big(y-j)) / factorial(big(z-j)) * exp(j*eta)
+        end
+    else
+        for j in 0:min(y,z)
+            sum = sum + (lambda*U*(1-alpha1-alpha3) + eta*(y-j))^(y-j-1) *
+                        (lambda*U*(1-alpha1-alpha3) + eta*(z-j))^(z-j-1) *
+                        (lambda*U*(alpha1+alpha3) + eta*(j))^(j-1) /
+                        factorial(j) / factorial(y-j) / factorial(z-j) * exp(j*eta)
+        end
     end
 
     return sum * (beta1+beta3) * (lambda*U*(1-alpha1-alpha3))^2 * exp(-(beta1+beta3)-2*(lambda*U*(1-alpha1-alpha3))-y*eta-z*eta)
 end
 
+#--------------------------------Draw random variable---------------------------
+function draw_random_generalized_poisson_variable(u, lambda, eta)
+    sum = 0.0
+    i = 0
+    while sum < u
+        sum = sum + generalized_poisson_distribution(i, lambda, eta)
+        i = i + 1
+    end
+    return i - 1
+end
 
+function draw_random_g_r_y_z_variable(u, y, z, lambda, alpha1, alpha2, alpha3, eta, max)
+    sum = 0.0
+    i = 0
+    while sum < u
+        sum = sum + compute_g_r_y_z(i, y, z, lambda, alpha1, alpha2, alpha3, eta, max)
+        i = i + 1
+    end
+    return i - 1
+end
 
+function draw_random_g_r_y_variable(u, y, alpha, eta, lambda)
+    sum = 0.0
+    i = 0
+    while sum < u
+        sum = sum + compute_g_r_y(y, i, alpha, eta, lambda)
+        i = i + 1
+    end
+    return i - 1
+end
 
+function draw_random_g(order, u, y, z, lambda, alpha1, alpha2, alpha3, alpha, eta, max)
+    if order == 1
+        return draw_random_g_r_y_variable(u, y, alpha, eta, lambda)
+    elseif order == 2
+        return draw_random_g_r_y_z_variable(u, y, z, lambda, alpha1, alpha2, alpha3, eta, max)
+    end
+end
 
+function cocoSim(type, order, parameter, n, covariates=nothing,
+                            link_function=exponential_function, n_burn_in=200,
+                            x=zeros(n + n_burn_in), max=nothing)
+
+    if !isnothing(covariates)
+        lambda = link_function.(repeat(covariates * parameter[(end-(size(covariates)[2]-1)):end], Int(ceil(1 + n_burn_in / n)))[(end-n_burn_in-n+1):end])
+    else
+        lambda = repeat([last(parameter)], n + n_burn_in)
+    end
+
+    if order == 2
+        alpha1 = parameter[1]
+        alpha2 = parameter[2]
+        alpha3 = parameter[3]
+        alpha = nothing
+
+        if type == "GP"
+            eta = parameter[4]
+        else
+            eta = 0
+        end
+    else
+        alpha1 = nothing
+        alpha2 = nothing
+        alpha3 = nothing
+        alpha = parameter[1]
+        if type == "GP"
+            eta = parameter[2]
+        else
+            eta = 0
+        end
+    end
+
+    for t in 3:(n + n_burn_in)
+        x[t] = draw_random_g(order, rand(Uniform(0,1),1)[1], Int(x[t-1]), Int(x[t-2]), lambda[t], alpha1, alpha2, alpha3, alpha, eta, max) +
+                draw_random_generalized_poisson_variable(rand(Uniform(0,1),1)[1], lambda[t], eta)
+
+    end
+
+    return x[(end-n+1):end]
+end
+
+function compute_distribution_convolution_x_r_y(x, y, lambda, alpha, eta)
+    if x < 0
+        return 0
+    end
+    return sum([compute_convolution_x_r_y(x, y, lambda, alpha, eta) for i in 0:x])
+end
+
+function compute_distribution_convolution_x_r_y_z(x, y, z, alpha1, alpha2, alpha3,
+                                            lambda, eta, max_loop=nothing)
+    if x < 0
+        return 0
+    end
+    return sum([compute_convolution_x_r_y_z(i, y, z, lambda,
+                            alpha1, alpha2, alpha3, eta,
+                            max_loop) for i in 0:x])
+end
+
+function cocoPit(cocoReg_fit, n_bins=21)
+    u = collect( range(0, stop = 1, length = n_bins+1) )
+    lambda = get_lambda(cocoReg_fit, false)
+
+    if cocoReg_fit["order"] == 1
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][2]
+        end
+        Px = [compute_distribution_convolution_x_r_y(cocoReg_fit["data"][t],
+                    cocoReg_fit["data"][t-1], lambda[t], cocoReg_fit["parameter"][1],
+                     eta) for t in 2:length(cocoReg_fit["data"])]
+        Pxm1 = [compute_distribution_convolution_x_r_y(cocoReg_fit["data"][t]-1,
+                cocoReg_fit["data"][t-1], lambda[t], cocoReg_fit["parameter"][1],
+                eta) for t in 2:length(cocoReg_fit["data"])]
+    elseif cocoReg_fit["order"] == 2
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][4]
+        end
+        Px = [compute_distribution_convolution_x_r_y_z(cocoReg_fit["data"][t],
+                                cocoReg_fit["data"][t-1], cocoReg_fit["data"][t-2],
+                                cocoReg_fit["parameter"][1], cocoReg_fit["parameter"][2],
+                                cocoReg_fit["parameter"][3], lambda[t],
+                                eta, cocoReg_fit["max_loop"]) for t in 3:length(cocoReg_fit["data"])]
+        Pxm1 = [compute_distribution_convolution_x_r_y_z(cocoReg_fit["data"][t]-1,
+                    cocoReg_fit["data"][t-1], cocoReg_fit["data"][t-2],
+                    cocoReg_fit["parameter"][1], cocoReg_fit["parameter"][2],
+                    cocoReg_fit["parameter"][3], lambda[t],
+                    eta, cocoReg_fit["max_loop"]) for t in 3:length(cocoReg_fit["data"])]
+    end
+
+    uniform_distribution = [get_pit_value(Px, Pxm1, u[s]) for s in 1:(n_bins+1)]
+
+    return Dict("Pit_values" => [uniform_distribution[s] - uniform_distribution[s-1] for s in 2:(n_bins+1)],
+                "bins" => u[2:end])
+end
+
+function get_pit_value(Px, Pxm1, u)
+    value = (u .- Pxm1) ./ (Px .- Pxm1)
+    value[value .<  0] .= 0
+    value[value .>  1] .= 1
+
+    return mean(value)
+end
+
+function plot_pit(cocoPit_object)
+        bar(cocoPit_object["bins"],
+         cocoPit_object["Pit_values"])
+end
+
+function compute_scores(cocoReg_fit)
+    lambda = get_lambda(cocoReg_fit, false)
+
+    if cocoReg_fit["order"] == 1
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][2]
+        end
+
+        probabilities = [compute_convolution_x_r_y(cocoReg_fit["data"][t],
+                         cocoReg_fit["data"][t-1], lambda[t], cocoReg_fit["parameter"][1],
+                         eta) for t in 2:length(cocoReg_fit["data"])]
+        h_index = [compute_h_index_1(cocoReg_fit["data"][t-1], lambda[t],
+                        cocoReg_fit["parameter"][1],
+                         eta) for t in 2:length(cocoReg_fit["data"])]
+
+        rbs = [compute_ranked_probability_helper_1(cocoReg_fit["data"][t],
+                         cocoReg_fit["data"][t-1], lambda[t], cocoReg_fit["parameter"][1],
+                         eta) for t in 2:length(cocoReg_fit["data"])]
+
+    elseif cocoReg_fit["order"] == 2
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][4]
+        end
+
+        probabilities = [compute_convolution_x_r_y_z(cocoReg_fit["data"][t],
+                        cocoReg_fit["data"][t-1], cocoReg_fit["data"][t-2], lambda[t],
+                        cocoReg_fit["parameter"][1],
+                        cocoReg_fit["parameter"][2], cocoReg_fit["parameter"][3],
+                         eta, cocoReg_fit["max_loop"]) for t in 3:length(cocoReg_fit["data"])]
+
+        h_index = [compute_h_index_2(cocoReg_fit["data"][t-1], cocoReg_fit["data"][t-2],
+                                    cocoReg_fit["parameter"][1],
+                        cocoReg_fit["parameter"][2], cocoReg_fit["parameter"][3],
+                        lambda[t],
+                         eta, cocoReg_fit["max_loop"]) for t in 3:length(cocoReg_fit["data"])]
+
+        rbs = [compute_ranked_probability_helper_2(cocoReg_fit["data"][t],
+                        cocoReg_fit["data"][t-1], cocoReg_fit["data"][t-2],
+                        cocoReg_fit["parameter"][1],
+                        cocoReg_fit["parameter"][2], cocoReg_fit["parameter"][3],
+                        lambda[t],
+                        eta, cocoReg_fit["max_loop"]) for t in 3:length(cocoReg_fit["data"])]
+    end
+
+    return Dict("logarithmic_score" => - sum(log.(probabilities)) / length(probabilities),
+                "quadratic_score" => sum(- 2 .* probabilities .+ h_index) / length(probabilities),
+                "ranked_probability_score" => sum(rbs) / length(probabilities)
+                )
+end
+
+function compute_h_index_1(y, lambda, alpha, eta)
+    return sum(([compute_convolution_x_r_y(s, y, lambda, alpha, eta) for s in 0:30]).^2)
+end
+
+function compute_ranked_probability_helper_1(x, y, lambda, alpha, eta)
+    dist_val = [compute_distribution_convolution_x_r_y(s, y, lambda, alpha, eta) for s in 0:30]
+    return sum(((x .<= 0:(length(dist_val)-1)) .* (1 .- dist_val) .+ (x .> 0:(length(dist_val)-1)) .* dist_val).^2)
+end
+
+function compute_h_index_2(y, z, alpha1, alpha2, alpha3, lambda, eta, max_loop=nothing)
+    return sum(([compute_convolution_x_r_y_z(s, y, z, lambda, alpha1, alpha2, alpha3,
+                                                 eta, max_loop) for s in 0:30]).^2)
+end
+
+function compute_ranked_probability_helper_2(x, y, z, alpha1, alpha2, alpha3,
+                                            lambda, eta, max_loop=nothing)
+    dist_val = [compute_distribution_convolution_x_r_y_z(s, y, z, alpha1, alpha2, alpha3,
+                                                lambda, eta, max_loop) for s in 0:30]
+    return sum(((x .<= 0:(length(dist_val)-1)) .* (dist_val .- 1) .+ (x .> 0:(length(dist_val)-1)) .* dist_val).^2)
+end
 #-------------------------------helper functions--------------------------------
 function compute_beta_i(lambda, U, alpha_i)
     return lambda*U*alpha_i
@@ -111,9 +342,7 @@ function compute_g_r_y_z(r, y, z, lambda, alpha1, alpha2, alpha3, eta, max)
     end
 
     sum = 0.0
-    for s in 0:max
-        for v in 0:max
-            for w in 0:max
+    for s in 0:max, v in 0:max, w in 0:max
                 if ((r-s-v) >= 0) & ((z-r+v-w) >= 0) & ((y-s-v-w) >= 0)
                     sum = sum + generalized_poisson_distribution(s, beta3, eta) *
                                 generalized_poisson_distribution(v, beta1, eta) *
@@ -122,8 +351,6 @@ function compute_g_r_y_z(r, y, z, lambda, alpha1, alpha2, alpha3, eta, max)
                                 generalized_poisson_distribution(z-r+v-w, lambda, eta) *
                                 generalized_poisson_distribution(y-s-v-w, zeta, eta)
                 end
-            end
-        end
     end
 
     return sum / bivariate_generalized_poisson(y, z, lambda, alpha1, alpha2, alpha3, eta)
@@ -178,6 +405,53 @@ function compute_convolution_x_r_y_z(x, y, z, lambda, alpha1, alpha2, alpha3, et
     return sum
 end
 
+function get_lambda(cocoReg_fit, last_val=false)
+
+    if isnothing(cocoReg_fit["covariates"])
+        return last(cocoReg_fit["parameter"])
+    else
+        if last_val
+            return cocoReg_fit["link"](cocoReg_fit["covariates"][end, :]' * cocoReg_fit["parameter"][(end-size(cocoReg_fit["covariates"])[2]+1):end])
+        else
+            return cocoReg_fit["link"](cocoReg_fit["covariates"] * cocoReg_fit["parameter"][(end-size(cocoReg_fit["covariates"])[2]+1):end])
+        end
+    end
+end
+
+function cocoPredict(cocoReg_fit, x=0:10, safe_array = Array{Float64}(undef, length(x)))
+
+    lambda = get_lambda(cocoReg_fit, true)
+
+    if cocoReg_fit["order"] == 2
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][4]
+        end
+
+        output = Dict("probabilities" => [compute_convolution_x_r_y_z(i, cocoReg_fit["data"][end], cocoReg_fit["data"][end-1], lambda,
+                                    cocoReg_fit["parameter"][1], cocoReg_fit["parameter"][2],
+                                    cocoReg_fit["parameter"][3], eta,
+                                    cocoReg_fit["max_loop"]) for i in x],
+                     "prediction_mode" => -3.0)
+    elseif cocoReg_fit["order"] == 1
+        if cocoReg_fit["type"] == "Poisson"
+            eta = 0
+        else
+            eta = cocoReg_fit["parameter"][2]
+        end
+
+        output = Dict("probabilities" => [compute_convolution_x_r_y(i, cocoReg_fit["data"][end],
+                                            lambda, cocoReg_fit["parameter"][1], eta) for i in x],
+                      "prediction_mode" => -3.0)
+    end
+
+    output["x"] = x
+    output["prediction_mode"] = x[argmax(output["probabilities"])]
+    output["prediction_median"] = x[findfirst(cumsum(output["probabilities"]) .>= 0.5)]
+
+    return output
+end
 
 
 #------------------------Helper-------------------------------------------------
@@ -382,8 +656,6 @@ function compute_eta_starting_value(data)
     return eta
 end
 
-
-
 #---------------------Bounds----------------------------------------------------
 function get_bounds_GP2(type, covariates)
 
@@ -435,9 +707,6 @@ end
 function cocoReg(type, order, data, covariates=nothing,
                 link_function=exponential_function, max_loop=nothing,
                 starting_values=nothing, optimizer=Fminbox(LBFGS()))
-
-
-
 
     #-------------------------start dependent on type----------------------------------------------------------
     if order == 2
@@ -507,7 +776,18 @@ function cocoReg(type, order, data, covariates=nothing,
     #construct output
     out = Dict("parameter" => parameter,
                "covariance_matrix" => compute_inverse_matrix(compute_hessian(f_alphas, parameter)),
-               "log_likelihood" => -f_alphas(parameter)
+               "log_likelihood" => -f_alphas(parameter),
+               "type" => type,
+               "order" => order,
+               "data" => data,
+               "covariates" => covariates,
+               "link" => link_function,
+               "starting_values" => starting_values,
+               "optimizer" => optimizer,
+               "lower_bounds" => lower,
+               "upper_bounds" => upper,
+               "optimization" => fit,
+               "max_loop" => max_loop
                )
 
     #compute standard errors
@@ -515,8 +795,45 @@ function cocoReg(type, order, data, covariates=nothing,
     return out
 end
 
+#----------------------cocoBoot-----------------------------------------------
+function compute_partial_autocorrelation(x, lags)
+    return autocov(x, lags, demean=true)
+end
 
+function cocoBoot(cocoReg_fit, lags=[1:1:21;],
+                 n_bootstrap=400, alpha=0.05, n_burn_in=200,
+                 store_matrix = Array{Float64}(undef, length(lags), 2))
 
+    pacfs = compute_random_pacfs(cocoReg_fit, lags, n_bootstrap, n_burn_in,
+                                Array{Float64}(undef, n_bootstrap, length(lags)))
+    for i in 1:length(lags)
+        store_matrix[ i, :] = quantile!(pacfs[:,i], [alpha, 1-alpha])
+    end
+
+    pacf_data = compute_partial_autocorrelation(cocoReg_fit["data"], lags)
+
+    return Dict("upper" => store_matrix[:, 1],
+                "lower" => store_matrix[:, 2],
+                "in_interval" => (store_matrix[:, 1] .< pacf_data) .& (store_matrix[:, 2] .> pacf_data),
+                "pacf_data" => pacf_data,
+                "lags" => lags
+         )
+end
+
+function compute_random_pacfs(cocoReg_fit, lags,
+                 n_bootstrap=400, n_burn_in=200,
+                 pacfs=Array{Float64}(undef, n_bootstrap, length(lags)))
+    Threads.@threads for b in 1:n_bootstrap
+        pacfs[b,:] = compute_partial_autocorrelation(cocoSim(cocoReg_fit["type"], cocoReg_fit["order"], cocoReg_fit["parameter"],
+                length(cocoReg_fit["data"]), cocoReg_fit["covariates"], cocoReg_fit["link"],
+                n_burn_in, zeros(length(cocoReg_fit["data"]) + n_burn_in), cocoReg_fit["max_loop"]), lags)
+    end
+    return pacfs
+end
+
+function plot_bootstrap(cocoBoot_object)
+    return plot(cocoBoot_object["lags"], [cocoBoot_object["lower"], cocoBoot_object["pacf_data"], cocoBoot_object["upper"]])
+end
 #------------------------test data------------------------------------------
 function read_time_series(path)
     df = DataFrame(XLSX.readtable(path, 1)...)
@@ -526,3 +843,29 @@ end
 function simulate_covariates(n, periodicity)
     return hcat(repeat([1], n) , sin.(Array(1:n) .* 2 .* pi ./ periodicity), cos.(Array(1:n) .* 2 .* pi ./ periodicity)  )
 end
+#------------------Test---------------------------------------------------------
+#const data = read_time_series("/home/manuel/Documents/coconots_julia_local/strikes.xlsx")
+
+#development
+const n_ts = 1000
+const covariates = simulate_covariates(n_ts, 10)
+const link_function=exponential_function
+const max_loop=nothing
+const optimizer = Fminbox(LBFGS())
+
+data1 = Int.(cocoSim("GP", 2, [0.1, 0.05, 0.3, 0.2, 0.01, 0.2, -0.2], n_ts, covariates))
+
+
+fit_results = cocoReg("GP", 2, data1, covariates,
+                exponential_function, nothing,
+                nothing, Fminbox(LBFGS()))
+
+cocoBoot_object = cocoBoot(fit_results)
+plot_bootstrap(cocoBoot_object)
+cocoPredict(fit_results)
+cocoPit_object = cocoPit(fit_results)
+plot_pit(cocoPit_object)
+compute_scores(fit_results)
+
+
+#residuals
